@@ -1,0 +1,557 @@
+import tkinter as tk
+import cv2
+from PIL import Image, ImageTk
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import execute_values
+from datetime import datetime, timedelta
+from tkinter import messagebox
+import  os
+from tkinter import simpledialog
+import time
+from tkinter import filedialog
+from io import BytesIO
+import io
+from tkinter import PhotoImage
+import imutils
+import numpy as np
+import pickle
+import face_recognition
+import threading
+
+nip = None
+id_mesin=1
+value_hsvlfg=1
+# Buka kamera
+cap = cv2.VideoCapture(0)
+def main(nip, frame):
+    encoding_path = "D:/ExPy/finalKamisRizkal/Deepface_faceRecognizer_v003/training/encoding1.pickle"
+    
+    # Memuat encoding wajah
+    with open(encoding_path, "rb") as file:
+        data = pickle.load(file)
+
+
+
+
+    if not cap.isOpened():
+        print("Error: Tidak bisa membuka webcam.")
+        return
+
+    ret, frame = cap.read()  # Membaca frame dari webcam
+    if not ret:
+        print("Error: Tidak dapat membaca frame.")
+        return
+    
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Mengubah ke RGB
+    rgb = imutils.resize(frame, width=400)  # Resize untuk efisiensi
+    r = frame.shape[1] / float(rgb.shape[1])  # Skalakan bounding box
+
+    boxes = face_recognition.face_locations(rgb, model="hog")  # Deteksi wajah
+    encodings = face_recognition.face_encodings(rgb, boxes)  # Ambil encoding wajah
+    names = []
+
+    for encoding in encodings:
+        # Cocokkan encoding dengan database
+        matches = face_recognition.compare_faces(data["encodings"], encoding, tolerance=0.38)
+        name = "Unknown"
+
+        if True in matches:
+            matchedIdxs = [i for (i, b) in enumerate(matches) if b]
+            counts = {}
+
+            for i in matchedIdxs:
+                matched_name = data["names"][i]  # Ambil NIP dari data encoding
+                counts[matched_name] = counts.get(matched_name, 0) + 1
+            
+            name = max(counts, key=counts.get)  # Ambil yang paling sering cocok
+            nip = os.path.basename(name)  # Ambil hanya NIP dari nama folder
+            
+            print(f"Wajah cocok dengan folder: {nip}")
+
+        names.append(name)
+        _, buffer = cv2.imencode(".jpg", frame)
+        image_binary = buffer.tobytes()  # Ubah ke biner sebelum masuk ke database
+        
+
+
+        # Tampilkan hasil verifikasi wajah jika nip ditemukan
+        if nip:  # Jika NIP ditemukan
+            handle_verify(nip, frame) 
+            simpan_wajah(nip, "Terverifikasi", frame)
+
+
+
+    # Gambar bounding box dan nama wajah
+    for ((top, right, bottom, left), name) in zip(boxes, names):
+        top = int(top * r)
+        right = int(right * r)
+        bottom = int(bottom * r)
+        left = int(left * r)
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+        y = top - 15 if top - 15 > 15 else top + 15
+        cv2.putText(frame, name, (left, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+
+    return frame
+
+
+# Fungsi utilitas untuk mendapatkan koneksi database
+def get_db_connection():
+    try:
+        return psycopg2.connect(
+            dbname="absensi",
+            user="postgres",
+            password="admin",
+            host="localhost",
+            port="5432"
+        )
+    except Exception as e:
+        print(f"Error saat menghubungkan ke database: {e}")
+        raise
+
+
+# Fungsi untuk menyimpan gambar ke database dan folder
+def simpan_wajah(nip, status, frame, folder_path="detected_faces"):
+    """Simpan gambar wajah ke database dan folder lokal"""
+
+    # Pastikan folder untuk menyimpan wajah ada
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+
+    # Konversi frame ke format JPEG untuk database
+    _, buffer = cv2.imencode(".jpg", frame)
+    image_binary = buffer.tobytes()
+
+    # Simpan ke database
+    query = """
+        INSERT INTO verifikasi_wajah (waktu, nip, status, face_image) 
+        VALUES (%s, %s, %s, %s)
+    """
+    data = (datetime.now(), nip, status, psycopg2.Binary(image_binary))
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, data)
+                conn.commit()
+                print(f"Data {nip} berhasil disimpan ke database.")
+    except Exception as e:
+        print(f"Error saat menyimpan ke database: {e}")
+
+    # Simpan ke folder
+    waktu_str = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format waktu untuk nama file
+    file_name = f"{nip}_{waktu_str}.jpg"
+    file_path = os.path.join(folder_path, file_name)
+
+    cv2.imwrite(file_path, frame)
+    print(f"Gambar wajah disimpan di: {file_path}")
+
+
+
+def handle_verify(nip, frame):
+
+    # Ambil data pegawai berdasarkan NIP
+    pegawai_data = get_pegawai_data(nip)
+
+    # Tampilkan foto dan informasi pegawai
+    if pegawai_data is not None:
+        status = attendance_var.get()  # Ambil status dari radio button
+        status_value_label.config(text="Terverifikasi", fg="#ADFF2F")
+        reset_status()
+        tampilkan_data_pegawai(pegawai_data['info'], pegawai_data['foto'])
+        display_captured_face(frame, nip, status)
+    else:
+        status_value_label.config(text="Tidak Terverifikasi", fg="red")
+        reset_status()
+        return
+
+    
+# Fungsi untuk mendapatkan waktu saat ini
+def get_current_time():
+    waktu_saat_ini = datetime.now().strftime("%H:%M:%S")
+    status = attendance_var.get()
+
+    # Menentukan warna status berdasarkan pilihan
+    if status == "MASUK":
+        status_color = "blue"
+    elif status == "KELUAR":
+        status_color = "red"
+    else:
+        status_color = "white"  # Jika tidak ada status, warna default adalah putih
+
+    status_label.config(text=status, fg=status_color)  # Mengubah warna statu
+    return f"{waktu_saat_ini}"
+
+def tampilkan_data_pegawai(info_data, image_binary):
+   # Ambil waktu saat ini
+    waktu_saat_ini = get_current_time()
+    
+    # Update data pegawai di label
+    nama_label.config(text=f"{'Nama'.ljust(30)}: {info_data['Nama']}")
+    nip_label.config(text=f"{'NIP'.ljust(32)}: {info_data['NIP']}")
+    departemen_label.config(text=f"{'Departemen'.ljust(25)}: {info_data['Departemen']}")
+    waktu_label.config(text=f"{'Waktu'.ljust(30)}: {waktu_saat_ini}")
+
+ # Update gambar pegawai
+    image = Image.open(io.BytesIO(image_binary))  # Convert byte ke gambar
+    image = image.resize((200, 280))  # Sesuaikan ukuran gambar
+    photo = ImageTk.PhotoImage(image)
+    image_label.config(image=photo)
+    image_label.image = photo  # Menyimpan referensi foto untuk update selanjutnya
+
+
+def get_pegawai_data(nip):
+    """Fungsi untuk mengambil data pegawai dan gambar berdasarkan NIP"""
+    
+    # Query untuk mengambil data dari tabel hrmas1
+    query_pegawai = """
+        SELECT h1eiiy, h1emid, h1emnm, h1denm 
+        FROM hrmas1 
+        WHERE LOWER(TRIM(h1emid)) = LOWER(TRIM(%s))
+    """
+    
+    # Query untuk mengambil gambar berdasarkan h1eiiy dari tabel hrmasf
+    query_gambar = """
+        SELECT f1pict 
+        FROM hrmasf 
+        WHERE f1eiiy = %s
+    """
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # Mengambil data pegawai berdasarkan NIP dari tabel hrmas1
+                cursor.execute(query_pegawai, (nip,))
+                row = cursor.fetchone()
+
+                if row:
+                    h1eiiy, nama, nip, departemen = row
+                    
+                    # Mengambil gambar berdasarkan h1eiiy dari tabel hrmasf
+                    cursor.execute(query_gambar, (h1eiiy,))
+                    foto_row = cursor.fetchone()
+                    foto_biner = foto_row[0] if foto_row else None  # Ambil foto jika ada
+                    
+                    # Menyusun data untuk dikembalikan
+                    info_data = {
+                        "Nama": nama,
+                        "NIP": nip,
+                        "Departemen": departemen,
+                    }
+                    
+                    # Mengembalikan informasi pegawai dan foto biner
+                    return {'info': info_data, 'foto': foto_biner}
+                else:
+                    print(f"NIP {nip} tidak ditemukan di tabel hrmas1.")
+                    return None
+    except Exception as e:
+        print(f"Error saat mengambil data pegawai: {e}")
+        return None
+
+   
+# Fungsi untuk mereset status ke "Scan Barcode..." setelah 5 detik
+def reset_status():
+    root.after(5000, lambda: status_value_label.config(text="Scan Barcode...", fg="white"))
+
+
+# Variabel untuk menyimpan label yang aktif
+current_label = None
+
+def update_label(event=None):
+    global current_label  # Variabel untuk menyimpan label yang sedang ditampilkan
+
+    status = attendance_var.get()
+
+    # Menghapus label lama jika ada
+    if current_label:
+        current_label.destroy()
+
+    # Tentukan teks dan warna berdasarkan status
+    if status == "MASUK":
+        label_text = "SILAHKAN ABSENSI MASUK"
+        label_color = "blue"
+    elif status == "KELUAR":
+        label_text = "SILAHKAN ABSENSI KELUAR"
+        label_color = "red"
+    else:
+        label_text = ""
+        label_color = "white"
+
+    # Buat label baru dengan teks dan warna yang sesuai
+    current_label = tk.Label(
+        content_frame,
+        text=label_text,
+        font=("Arial Black", 12),
+        bg="#008080",
+        fg=label_color
+    )
+
+    # Tempatkan label pada posisi yang diinginkan
+    current_label.place(x=5, y=110)
+
+    selected_value = attendance_var.get()
+
+    if selected_value == "MASUK":
+        radio_masuk.config(selectcolor="blue")   # Warna saat aktif
+        radio_keluar.config( selectcolor="#008080")  # Kembali ke warna default
+        status_box.config(bg="blue") 
+    elif selected_value == "KELUAR":
+        radio_keluar.config( selectcolor="red")  # Warna saat aktif
+        radio_masuk.config( selectcolor="#008080")  # Kembali ke warna default
+        status_box.config(bg="red") 
+
+
+
+# Membuat root window
+root = tk.Tk()
+root.geometry("900x600")  # Ukuran window agar proporsional
+root.title("Sistem Absensi")
+
+# ################### Frame Utama (Konten) #####################
+content_frame = tk.Frame(
+    root, 
+    bg="#008080", 
+    bd=5, 
+    relief="solid", 
+    highlightbackground="#00CED1",
+    highlightthickness=5
+)
+content_frame.pack(fill="both", expand=True, side="right", padx=0, pady=0)
+
+
+# Create status box for verification (kotak di belakang frame kamera)
+status_box = tk.Frame(content_frame, width=550, height=395, bg="#008080")  # Ukuran disesuaikan
+status_box.place(x=0, y=282)
+
+# ==================== Label Utama ==================== #
+content_label = tk.Label(
+    content_frame,
+    text="ABSENSI POS 1",
+    font=("Arial Black", 14, "bold"),
+    fg="white",
+    bg="#008080",
+    padx=0,
+    pady=0
+)
+content_label.pack(pady=5)
+
+# ==================== Garis Separator ==================== #
+separator = tk.Frame(content_frame, bg="white", height=3)  # Warna bisa disesuaikan
+separator.pack(fill="x", padx=0, pady=5)  # Full ke samping, dengan sedikit jarak
+
+# ================= Frame Radio Button di Pinggir Kiri ================= #
+radio_frame = tk.Frame(content_frame, bg="#008080")
+radio_frame.pack(fill="x", padx=20, pady=0)  # Ditempatkan di kiri
+
+def create_radio_button(frame, text, value):
+    return tk.Radiobutton(
+        frame,
+        text=text,
+        variable=attendance_var,
+        value=value,
+        font=("Arial Black", 13, "bold"),
+        fg="white",
+        bg="#008080",
+        activebackground="#008080",
+        selectcolor="#008080",
+        relief="raised",
+        bd=3,
+        indicatoron=False,
+        width=17,  # Ukuran tombol seragam
+        height=1,  # Menambah tinggi agar lebih proporsional
+        command=update_label
+    )
+
+
+attendance_var = tk.StringVar(value="verifikasi")
+
+# ==================== Radio Buttons ==================== #
+radio_masuk = create_radio_button(radio_frame, "ABSENSI MASUK", "MASUK")
+radio_masuk.pack(side="left", padx=30, pady=0)  # Jarak antar tombol
+
+radio_keluar = create_radio_button(radio_frame, "ABSENSI KELUAR", "KELUAR")
+radio_keluar.pack(side="left", padx=30, pady=0)  # Jarak antar tombol
+
+# ==================== Separator Kiri ==================== #
+separator_kiri = tk.Frame(content_frame, bg="white", height=3, width=600)  # Separator kiri dengan lebar tertentu
+separator_kiri.place(x=0, y=100)  # Menempatkan separator kiri dengan jarak tertentu
+
+# ==================== Separator Kanan ==================== #
+separator_kanan = tk.Frame(content_frame, bg="white", height=3, width=610)  # Separator kanan dengan lebar tertentu
+separator_kanan.place(x=650, y=100)  # Menempatkan separator kanan dengan jarak tertentu
+
+# ==================== Label Absensi Terakhir ==================== #
+Absensiterakhir_label = tk.Label(
+    content_frame,  # Menempatkan label di dalam label_frame
+    text="ABSENSI TERAKHIR",
+    font=("Arial Black", 14, "bold"),
+    fg="white",
+    bg="#008080",
+    padx=200,
+    pady=0
+)
+Absensiterakhir_label.place(x=630, y=60)  # Menempatkan label tepat di atas separator kanan
+
+# ==================== Teks Status ==================== #
+status_label = tk.Label(
+    content_frame,
+    text=f"{'Status'.ljust(30)}: ",  # Jarak antara teks "Status" dan ":"
+    font=("Arial Black", 12, "bold"),
+    fg="white",
+    bg="#008080"
+)
+status_label.place(x=5, y=150)
+
+# Label untuk nilai status (default: kosong)
+status_value_label = tk.Label(
+    content_frame,
+    text="Scan Barcode...",  # Status awal
+    font=("Arial Black", 12, "bold"),
+    fg="white",
+    bg="#008080"
+)
+status_value_label.place(x=200, y=150)
+
+##################### KAMERA FRAME ###############################
+camera_frame = tk.Frame(content_frame, bg="#008080", height=250, width=250)
+camera_frame.pack(side="left", padx=140, pady=40 )
+
+
+camera_title = tk.Label(
+    camera_frame,
+    text="KAMERA",
+    font=("Arial Black", 12, "bold"),
+    fg="white",
+    bg="#008080"
+)
+camera_title.pack(padx=0, pady=10)
+
+# Variabel global untuk menyimpan wajah terbesar yang terdeteksi
+largest_face = None
+
+def show_camera():
+    global nip
+
+    # Baca frame dari webcam
+    ret, frame = cap.read()
+    if not ret:
+        print("Tidak bisa membaca frame.")
+        return
+
+    frame = main(nip, frame)  # Panggil fungsi main untuk deteksi wajah
+
+    # Mengubah frame menjadi format yang dapat ditampilkan oleh Tkinter
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image_pil = Image.fromarray(rgb_frame)
+    image_pil = image_pil.resize((340, 280))  # Sesuaikan ukuran gambar
+    photo = ImageTk.PhotoImage(image_pil)
+
+    # Update label dengan gambar terbaru
+    camera_label.config(image=photo)
+    camera_label.image = photo  # Simpan referensi agar gambar tidak hilang
+
+    # Panggil ulang fungsi ini setiap 50ms
+    camera_label.after(10, show_camera)
+
+
+# Create the camera_label outside the function to avoid re-creating it on every call
+camera_label = tk.Label(camera_frame)
+camera_label.pack()
+
+##################### INFORMASI DI SAMPING TEXT BOX ###################
+# Frame untuk informasi pegawai
+info_frame = tk.Frame(content_frame, bg="#008080")
+info_frame.pack(fill="x", padx=100, pady=15)
+
+# Label untuk menampilkan informasi pegawai
+nama_label = tk.Label(info_frame, text="Nama: -", font=("Arial Black", 11), fg="white", bg="#008080", anchor="w", padx=10)
+nama_label.grid(row=0, column=0, sticky="w", padx=10, pady=5)
+
+nip_label = tk.Label(info_frame, text="NIP: -", font=("Arial Black", 11), fg="white", bg="#008080", anchor="w", padx=10)
+nip_label.grid(row=1, column=0, sticky="w", padx=10, pady=5)
+
+departemen_label = tk.Label(info_frame, text="Departemen: -", font=("Arial Black", 11), fg="white", bg="#008080", anchor="w", padx=10)
+departemen_label.grid(row=2, column=0, sticky="w", padx=10, pady=5)
+
+waktu_label = tk.Label(info_frame, text="Waktu: -", font=("Arial Black", 11), fg="white", bg="#008080", anchor="w", padx=10)
+waktu_label.grid(row=3, column=0, sticky="w", padx=10, pady=5)
+# Label untuk status
+status_label = tk.Label(info_frame, text="Status: -", font=("Arial Black", 11), fg="white", bg="#008080", anchor="w", padx=0)
+status_label.grid(row=3, column=1, sticky="w", padx=0, pady=5)
+
+# Frame untuk menampung FOTO PROFIL dan FOTO CAPTURE
+image_frame = tk.Frame(info_frame, bg="#008080")
+image_frame.grid(row=6, column=0, columnspan=2, pady=20)
+
+# Label untuk judul FOTO PROFIL
+image_personal_title = tk.Label(
+    image_frame,
+    text="FOTO PROFIL",
+    font=("Arial Black", 11, "bold"),
+    fg="white",
+    bg="#008080"
+)
+image_personal_title.grid(row=0, column=0, sticky="w", padx=15, pady=5)
+
+# Label untuk menampilkan FOTO PROFIL
+image_label = tk.Label(image_frame, bg="#008080")
+image_label.grid(row=1, column=0, sticky="w", padx=10, pady=10)  # Gambar berada di bawah "FOTO PROFIL"
+
+# Label untuk judul FOTO CAPTURE
+image_capture_title = tk.Label(
+    image_frame,
+    text="FOTO CAPTURE",
+    font=("Arial Black", 11, "bold"),
+    fg="white",
+    bg="#008080"
+)
+image_capture_title.grid(row=0, column=1, sticky="w", padx=15, pady=5)  # Judul berada di kolom 1
+
+# Label untuk gambar yang dicapture (wajah)
+captured_face_label = tk.Label(image_frame, bg="#008080")
+captured_face_label.grid(row=1, column=1, sticky="w", padx=10, pady=10)  # Gambar berada di samping "FOTO CAPTURE"
+
+
+def display_captured_face(frame, nip, status):
+    try:
+        if largest_face is not None:
+            # Ambil bagian wajah dari frame menggunakan koordinat wajah terbesar yang disimpan
+            x, y, w, h = largest_face
+            face_image = frame[y:y+h, x:x+w]
+
+            # Ubah frame wajah menjadi format RGB untuk digunakan di Tkinter
+            img_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(img_rgb)
+
+            # Ubah ukuran gambar wajah agar sesuai dengan label
+            pil_image = pil_image.resize((220, 280), Image.Resampling.LANCZOS)
+
+            # Konversi gambar menjadi format yang dapat ditampilkan di Tkinter
+            photo = ImageTk.PhotoImage(pil_image)
+
+            # Tampilkan di label
+            captured_face_label.config(image=photo)
+            captured_face_label.image = photo  # Simpan referensi gambar agar tidak hilang
+              # # If a match is found, save to database and exit
+            _, img_encoded = cv2.imencode('.jpg', face_image)
+            image_binary = img_encoded.tobytes()
+            simpan_database_verifikasi(nip, status, image_binary)
+        else:
+            print("Tidak ada wajah yang terdeteksi.")
+ 
+    except Exception as e:
+        print(f"Error saat menampilkan wajah: {e}")
+
+
+# Buka kamera
+cap = cv2.VideoCapture(0)
+update_label()
+# Menjalankan fungsi untuk menampilkan kamera
+show_camera()
+# Menjalankan aplikasi
+root.mainloop()
+
+# Tutup kamera saat aplikasi ditutup
+cap.release()
+cv2.destroyAllWindows()
+   
