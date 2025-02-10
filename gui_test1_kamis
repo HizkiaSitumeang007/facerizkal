@@ -19,81 +19,249 @@ import pickle
 import face_recognition
 import threading
 
+url = "rtsp://admin:adr12345@192.168.1.23:554"
 nip = None
 id_mesin=1
 value_hsvlfg=1
 # Buka kamera
+frame = None
+lock = threading.Lock() 
+
 cap = cv2.VideoCapture(0)
-def main(nip, frame):
-    encoding_path = "D:/ExPy/finalKamisRizkal/Deepface_faceRecognizer_v003/training/encoding1.pickle"
-    
+
+# Menyimpan NIP yang sudah absen dan timestamp terakhir kali terdeteksi
+absent_nips = {}
+encoding_path = "D:/ExPy/finalKamisRizkal/Deepface_faceRecognizer_v003/training/encoding1.pickle"
+
+
     # Memuat encoding wajah
-    with open(encoding_path, "rb") as file:
-        data = pickle.load(file)
+with open(encoding_path, "rb") as file:
+    data = pickle.load(file)
 
+largest_face = None
+latest_frame = None  # Menyimpan frame terbaru
+lock = threading.Lock()  # Lock untuk mencegah race condition
 
+def detect_faces():
+    """Fungsi yang berjalan di thread terpisah untuk deteksi wajah."""
+    global latest_frame, nip
 
-
-    if not cap.isOpened():
-        print("Error: Tidak bisa membuka webcam.")
-        return
-
-    ret, frame = cap.read()  # Membaca frame dari webcam
-    if not ret:
-        print("Error: Tidak dapat membaca frame.")
-        return
-    
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Mengubah ke RGB
-    rgb = imutils.resize(frame, width=400)  # Resize untuk efisiensi
-    r = frame.shape[1] / float(rgb.shape[1])  # Skalakan bounding box
-
-    boxes = face_recognition.face_locations(rgb, model="hog")  # Deteksi wajah
-    encodings = face_recognition.face_encodings(rgb, boxes)  # Ambil encoding wajah
-    names = []
-
-    for encoding in encodings:
-        # Cocokkan encoding dengan database
-        matches = face_recognition.compare_faces(data["encodings"], encoding, tolerance=0.38)
-        name = "Unknown"
-
-        if True in matches:
-            matchedIdxs = [i for (i, b) in enumerate(matches) if b]
-            counts = {}
-
-            for i in matchedIdxs:
-                matched_name = data["names"][i]  # Ambil NIP dari data encoding
-                counts[matched_name] = counts.get(matched_name, 0) + 1
-            
-            name = max(counts, key=counts.get)  # Ambil yang paling sering cocok
-            nip = os.path.basename(name)  # Ambil hanya NIP dari nama folder
-            
-            print(f"Wajah cocok dengan folder: {nip}")
-
-        names.append(name)
-        _, buffer = cv2.imencode(".jpg", frame)
-        image_binary = buffer.tobytes()  # Ubah ke biner sebelum masuk ke database
+    while True:
+        if latest_frame is None:
+            time.sleep(0.1)
+            continue
         
+        with lock:
+            frame_copy = latest_frame.copy()
+
+        rgb = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
+        rgb = imutils.resize(rgb, width=400)
+        r = frame_copy.shape[1] / float(rgb.shape[1])
+
+        boxes = face_recognition.face_locations(rgb, model="hog")
+        encodings = face_recognition.face_encodings(rgb, boxes)
+
+        names = []
+        for encoding in encodings:
+            matches = face_recognition.compare_faces(data["encodings"], encoding, tolerance=0.38)
+            name = "Unknown"
+
+            if True in matches:
+                matchedIdxs = [i for (i, b) in enumerate(matches) if b]
+                counts = {}
+
+                for i in matchedIdxs:
+                    matched_name = data["names"][i]
+                    counts[matched_name] = counts.get(matched_name, 0) + 1
+                
+                name = max(counts, key=counts.get)
+                nip = os.path.basename(name)
+
+                current_time = time.time()
+                if nip not in absent_nips or (current_time - absent_nips[nip] > 10):
+                    handle_verify(nip, frame_copy)
+                    _, image_binary = cv2.imencode('.jpg', frame_copy)
+                    image_binary = image_binary.tobytes()
+                    status = attendance_var.get()
+                    simpan_database_verifikasi(nip, status, image_binary)
+                    absent_nips[nip] = current_time
+
+                    image = Image.open(io.BytesIO(image_binary))
+                    image = image.resize((200, 280))
+                    photo = ImageTk.PhotoImage(image)
+                    captured_face_label.config(image=photo)
+                    captured_face_label.image = photo
+
+            names.append(name)
+
+        # Gambar bounding box
+        for ((top, right, bottom, left), name) in zip(boxes, names):
+            top = int(top * r)
+            right = int(right * r)
+            bottom = int(bottom * r)
+            left = int(left * r)
+            cv2.rectangle(frame_copy, (left, top), (right, bottom), (0, 255, 0), 2)
+            y = top - 15 if top - 15 > 15 else top + 15
+            cv2.putText(frame_copy, name, (left, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+
+        with lock:
+            latest_frame = frame_copy
+
+        time.sleep(0.5)  # Batasi deteksi setiap 500ms
+
+def show_camera():
+    """Fungsi untuk membaca frame dari kamera dan memperbarui UI."""
+    global latest_frame
+
+    ret, frame = cap.read()
+    if not ret:
+        print("Tidak bisa membaca frame.")
+        return
+
+    with lock:
+        latest_frame = frame.copy()  # Simpan frame terbaru
+        frame = latest_frame.copy() 
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image_pil = Image.fromarray(rgb_frame)
+    image_pil = image_pil.resize((340, 280))
+    photo = ImageTk.PhotoImage(image_pil)
+
+    camera_label.config(image=photo)
+    camera_label.image = photo
+
+    camera_label.after(10, show_camera)
+
+# Mulai thread deteksi wajah
+threading.Thread(target=detect_faces, daemon=True).start()
+# # Variabel global untuk menyimpan wajah terbesar yang terdeteksi
+# largest_face = None
+
+# def show_camera():
+#     global nip
+
+#     # Baca frame dari webcam
+#     ret, frame = cap.read()
+#     if not ret:
+#         print("Tidak bisa membaca frame.")
+#         return
+
+#     frame = main(nip,frame)  # Panggil fungsi main untuk deteksi wajah
+
+#     # Mengubah frame menjadi format yang dapat ditampilkan oleh Tkinter
+#     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+#     image_pil = Image.fromarray(rgb_frame)
+#     image_pil = image_pil.resize((340, 280))  # Sesuaikan ukuran gambar
+#     photo = ImageTk.PhotoImage(image_pil)
+
+#     # Update label dengan gambar terbaru
+#     camera_label.config(image=photo)
+#     camera_label.image = photo  # Simpan referensi agar gambar tidak hilang
+
+#     # Panggil ulang fungsi ini setiap 50ms
+#     camera_label.after(10, show_camera)
 
 
-        # Tampilkan hasil verifikasi wajah jika nip ditemukan
-        if nip:  # Jika NIP ditemukan
-            handle_verify(nip, frame) 
-            simpan_wajah(nip, "Terverifikasi", frame)
+# # Fungsi utama untuk mendeteksi wajah dan absensi
+# def main(nip, frame): 
+
+#     if not cap.isOpened():
+#         print("Error: Tidak bisa membuka webcam.")
+#         return
+
+#     ret, frame = cap.read()  # Membaca frame dari webcam
+#     if not ret:
+#         print("Error: Tidak dapat membaca frame.")
+#         return
+    
+#     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Mengubah ke RGB
+#     rgb = imutils.resize(frame, width=240)  # Resize untuk efisiensi
+#     r = frame.shape[1] / float(rgb.shape[1])  # Skalakan bounding box
+
+#     boxes = face_recognition.face_locations(rgb, model="hog")  # Deteksi wajah
+#     encodings = face_recognition.face_encodings(rgb, boxes)  # Ambil encoding wajah
+#     names = []
+
+#     for encoding in encodings:
+#         # Cocokkan encoding dengan database
+#         matches = face_recognition.compare_faces(data["encodings"], encoding, tolerance=0.38)
+#         name = "Unknown"
+
+#         if True in matches:
+#             matchedIdxs = [i for (i, b) in enumerate(matches) if b]
+#             counts = {}
+
+#             for i in matchedIdxs:
+#                 matched_name = data["names"][i]  # Ambil NIP dari data encoding
+#                 counts[matched_name] = counts.get(matched_name, 0) + 1
+            
+#             name = max(counts, key=counts.get)  # Ambil yang paling sering cocok
+#             nip = os.path.basename(name)  # Ambil hanya NIP dari nama folder
+            
+#             # print(f"Wajah cocok dengan folder: {nip}")
+      
+#             if nip:  # Jika NIP ditemukan
+#                 # Cek jika NIP sudah pernah terdeteksi dan pastikan ada batasan waktu
+#                 current_time = time.time()  # Waktu saat ini dalam detik
+#                 if nip not in absent_nips or (current_time - absent_nips[nip] > 10):  # 10 detik batasan
+#                     # Kirim data absensi dan simpan ke database
+#                     handle_verify(nip, frame)
+#                     # Ubah gambar wajah menjadi biner
+#                     _, image_binary = cv2.imencode('.jpg', frame)
+#                     image_binary = image_binary.tobytes()  # Mengubah menjadi binary
+#                     status = attendance_var.get()
+
+#                     # Panggil fungsi untuk menyimpan ke database
+#                     simpan_database_verifikasi(nip, status, image_binary)
+#                     # simpan_ke_folder_lokal(nip, frame)
+
+#                     # Simpan timestamp terakhir kali wajah ini terdeteksi
+#                     absent_nips[nip] = current_time
+
+#                     # Menampilkan gambar pada UI
+#                     image = Image.open(io.BytesIO(image_binary))  # Convert byte ke gambar
+#                     image = image.resize((200, 280))  # Sesuaikan ukuran gambar
+#                     photo = ImageTk.PhotoImage(image)
+#                     captured_face_label.config(image=photo)
+#                     captured_face_label.image = photo  # Menyimpan referensi foto untuk update selanjutnya
+
+#         names.append(name)
+
+#     # Gambar bounding box dan nama wajah
+#     for ((top, right, bottom, left), name) in zip(boxes, names):
+#         top = int(top * r)
+#         right = int(right * r)
+#         bottom = int(bottom * r)
+#         left = int(left * r)
+#         cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+#         y = top - 15 if top - 15 > 15 else top + 15
+#         cv2.putText(frame, name, (left, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+#     return frame
+# time.sleep(0.5)
+
+# # Mulai thread deteksi wajah
+# threading.Thread(target=main, daemon=True).start()
 
 
+# Jalankan worker thread untuk deteksi wajah
+# Jalankan proses deteksi wajah di thread terpisah
+# threading.Thread(target=show_camera, daemon=True).start()
 
-    # Gambar bounding box dan nama wajah
-    for ((top, right, bottom, left), name) in zip(boxes, names):
-        top = int(top * r)
-        right = int(right * r)
-        bottom = int(bottom * r)
-        left = int(left * r)
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-        y = top - 15 if top - 15 > 15 else top + 15
-        cv2.putText(frame, name, (left, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+# def simpan_ke_folder_lokal(nip, face_image):
+#     # Tentukan folder tempat menyimpan gambar wajah
+#     folder_path = "DATA2"  # Ganti dengan path folder yang sesuai
 
-    return frame
+#     # Buat folder jika belum ada
+#     if not os.path.exists(folder_path):
+#         os.makedirs(folder_path)
+    
+#     # Tentukan nama file untuk gambar
+#     image_filename = f"{nip}_face.jpg"
+#     image_path = os.path.join(folder_path, image_filename)
 
+#     # Simpan gambar ke folder lokal
+#     cv2.imwrite(image_path, face_image)
+#     # print(f"Gambar wajah disimpan di: {image_path}")
 
 # Fungsi utilitas untuk mendapatkan koneksi database
 def get_db_connection():
@@ -110,42 +278,38 @@ def get_db_connection():
         raise
 
 
-# Fungsi untuk menyimpan gambar ke database dan folder
-def simpan_wajah(nip, status, frame, folder_path="detected_faces"):
-    """Simpan gambar wajah ke database dan folder lokal"""
-
-    # Pastikan folder untuk menyimpan wajah ada
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-
-    # Konversi frame ke format JPEG untuk database
-    _, buffer = cv2.imencode(".jpg", frame)
-    image_binary = buffer.tobytes()
-
-    # Simpan ke database
-    query = """
-        INSERT INTO verifikasi_wajah (waktu, nip, status, face_image) 
-        VALUES (%s, %s, %s, %s)
-    """
-    data = (datetime.now(), nip, status, psycopg2.Binary(image_binary))
-
+def simpan_database_verifikasi(nip, status, image_binary):
+    # Convert status to integer (1 for "MASUK", 0 for "KELUAR")
+    status_int = 1 if status == "MASUK"  else 0
+    # Query untuk mengambil data pegawai berdasarkan NIP
+    query_hrmas1 = "SELECT h1eiiy, h1emid, h1emnm, h1denm FROM hrmas1 WHERE LOWER(TRIM(h1emid)) = LOWER(TRIM(%s))"
+    
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(query, data)
-                conn.commit()
-                print(f"Data {nip} berhasil disimpan ke database.")
+                # Mengambil data pegawai dari tabel hrmas1
+                cursor.execute(query_hrmas1, (nip,))
+                result = cursor.fetchone()
+
+                if result is not None:
+                    hseiiy, hsmid, hsemnm, hsdenm = result
+                    
+                    # Menyusun query untuk menyimpan data verifikasi
+                    query = """
+                        INSERT INTO habsen (hsmciy, hseiiy, hsemid, hsemnm, hsdenm, hstime, hsstat, hspict, hsvlfg) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,%s)
+                    """
+                    # Menyusun data untuk disimpan ke dalam tabel habsen
+                    data = (id_mesin, hseiiy, hsmid, hsemnm, hsdenm, datetime.now(), status_int, psycopg2.Binary(image_binary), value_hsvlfg)
+                    
+                    # Menyimpan data ke tabel habsen
+                    cursor.execute(query, data)
+                    conn.commit()
+                    # print(f"Data verifikasi untuk NIP {nip} berhasil disimpan ke database.")
+                else:
+                    print(f"NIP {nip} tidak ditemukan di tabel hrmas1.")
     except Exception as e:
-        print(f"Error saat menyimpan ke database: {e}")
-
-    # Simpan ke folder
-    waktu_str = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format waktu untuk nama file
-    file_name = f"{nip}_{waktu_str}.jpg"
-    file_path = os.path.join(folder_path, file_name)
-
-    cv2.imwrite(file_path, frame)
-    print(f"Gambar wajah disimpan di: {file_path}")
-
+        print(f"Error saat menyimpan data verifikasi: {e}")
 
 
 def handle_verify(nip, frame):
@@ -159,7 +323,7 @@ def handle_verify(nip, frame):
         status_value_label.config(text="Terverifikasi", fg="#ADFF2F")
         reset_status()
         tampilkan_data_pegawai(pegawai_data['info'], pegawai_data['foto'])
-        display_captured_face(frame, nip, status)
+        # display_captured_face(frame, nip, status)
     else:
         status_value_label.config(text="Tidak Terverifikasi", fg="red")
         reset_status()
@@ -242,7 +406,7 @@ def get_pegawai_data(nip):
                     # Mengembalikan informasi pegawai dan foto biner
                     return {'info': info_data, 'foto': foto_biner}
                 else:
-                    print(f"NIP {nip} tidak ditemukan di tabel hrmas1.")
+                    # print(f"NIP {nip} tidak ditemukan di tabel hrmas1.")
                     return None
     except Exception as e:
         print(f"Error saat mengambil data pegawai: {e}")
@@ -426,34 +590,6 @@ camera_title = tk.Label(
 )
 camera_title.pack(padx=0, pady=10)
 
-# Variabel global untuk menyimpan wajah terbesar yang terdeteksi
-largest_face = None
-
-def show_camera():
-    global nip
-
-    # Baca frame dari webcam
-    ret, frame = cap.read()
-    if not ret:
-        print("Tidak bisa membaca frame.")
-        return
-
-    frame = main(nip, frame)  # Panggil fungsi main untuk deteksi wajah
-
-    # Mengubah frame menjadi format yang dapat ditampilkan oleh Tkinter
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image_pil = Image.fromarray(rgb_frame)
-    image_pil = image_pil.resize((340, 280))  # Sesuaikan ukuran gambar
-    photo = ImageTk.PhotoImage(image_pil)
-
-    # Update label dengan gambar terbaru
-    camera_label.config(image=photo)
-    camera_label.image = photo  # Simpan referensi agar gambar tidak hilang
-
-    # Panggil ulang fungsi ini setiap 50ms
-    camera_label.after(10, show_camera)
-
-
 # Create the camera_label outside the function to avoid re-creating it on every call
 camera_label = tk.Label(camera_frame)
 camera_label.pack()
@@ -461,7 +597,7 @@ camera_label.pack()
 ##################### INFORMASI DI SAMPING TEXT BOX ###################
 # Frame untuk informasi pegawai
 info_frame = tk.Frame(content_frame, bg="#008080")
-info_frame.pack(fill="x", padx=100, pady=15)
+info_frame.pack(fill="x", padx=0, pady=15)
 
 # Label untuk menampilkan informasi pegawai
 nama_label = tk.Label(info_frame, text="Nama: -", font=("Arial Black", 11), fg="white", bg="#008080", anchor="w", padx=10)
@@ -512,39 +648,7 @@ captured_face_label = tk.Label(image_frame, bg="#008080")
 captured_face_label.grid(row=1, column=1, sticky="w", padx=10, pady=10)  # Gambar berada di samping "FOTO CAPTURE"
 
 
-def display_captured_face(frame, nip, status):
-    try:
-        if largest_face is not None:
-            # Ambil bagian wajah dari frame menggunakan koordinat wajah terbesar yang disimpan
-            x, y, w, h = largest_face
-            face_image = frame[y:y+h, x:x+w]
 
-            # Ubah frame wajah menjadi format RGB untuk digunakan di Tkinter
-            img_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(img_rgb)
-
-            # Ubah ukuran gambar wajah agar sesuai dengan label
-            pil_image = pil_image.resize((220, 280), Image.Resampling.LANCZOS)
-
-            # Konversi gambar menjadi format yang dapat ditampilkan di Tkinter
-            photo = ImageTk.PhotoImage(pil_image)
-
-            # Tampilkan di label
-            captured_face_label.config(image=photo)
-            captured_face_label.image = photo  # Simpan referensi gambar agar tidak hilang
-              # # If a match is found, save to database and exit
-            _, img_encoded = cv2.imencode('.jpg', face_image)
-            image_binary = img_encoded.tobytes()
-            simpan_database_verifikasi(nip, status, image_binary)
-        else:
-            print("Tidak ada wajah yang terdeteksi.")
- 
-    except Exception as e:
-        print(f"Error saat menampilkan wajah: {e}")
-
-
-# Buka kamera
-cap = cv2.VideoCapture(0)
 update_label()
 # Menjalankan fungsi untuk menampilkan kamera
 show_camera()
@@ -555,3 +659,5 @@ root.mainloop()
 cap.release()
 cv2.destroyAllWindows()
    
+      #192.168.1.23
+            #pass:adr12345
